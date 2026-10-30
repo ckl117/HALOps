@@ -28,6 +28,7 @@ HALOps is designed from the ground up for NVIDIA Blackwell (SM100). Built on CUT
 - **GQA attention**: variable-length prefill and paged-KV decode across BF16 / FP8 KV cache, GQA and MTP; split-KV parallelism, adaptive reduction and fused pre/post-processing make full use of SM100 compute and bandwidth in long-context and small-batch decode.
 - **Multi-precision GEMM**: FP8 (MXFP8) and FP4 (NVFP4 / MXFP4) block-scaled GEMM for dense, batched and MoE grouped workloads; with ultra-lightweight flexible tile configurations and pre-mapped tile scheduling, it delivers industry-leading performance across all scenarios on SM100.
 - **MegaKernel sparse MLA**: high-performance MegaKernel sparse attention for both HCA and SWA layers. It absorbs the many small surrounding ops (projections, normalization, RoPE, KV cache write and compression) into a single kernel, removing kernel scheduling and intermediate memory round trips, and orchestrates tile-level pipelines so the compute and memory traffic of different stages overlap, pushing GPU utilization further.
+- **DSA indexer preparation**: [`indexer_prepare`](docs/indexer_prepare.md) fuses Q/K projection, normalization, RoPE, Hadamard rotation, FP8 quantization, paged K-cache writes and weight scaling into one kernel for the fixed 64-head, 128-dimensional indexer configuration.
 - **Low precision end to end**: quantization, fused SwiGLU + quantization and expert permutation write the scale layout the GEMMs read, so low-precision data flows between operators without layout conversion.
 
 ## Performance

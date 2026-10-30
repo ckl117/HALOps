@@ -28,6 +28,7 @@ HALOps 面向 NVIDIA Blackwell（SM100）从零设计，基于 CUTLASS / CuTe �
 - **GQA Attention**：支持变长 prefill 与 paged-KV decode，覆盖 BF16 / FP8 KV cache、GQA 与 MTP 等推理场景，结合 split-KV 并行、自适应规约与前后处理算子融合，在长上下文与小 batch decode 下充分释放 SM100 的算力与带宽。
 - **多精度 GEMM**：支持 FP8（MXFP8）与 FP4（NVFP4 / MXFP4）block-scaled GEMM，覆盖 dense、batched 与 MoE grouped 场景，结合超轻量开销的灵活 tile 配置与 pre-mapping tile 调度等策略，在 SM100 架构上取得了全场景业界领先的性能。
 - **巨内核稀疏 MLA**：支持 HCA 与 SWA 两类层的高性能巨内核（MegaKernel）稀疏 attention，将投影、归一化、RoPE、KV cache 写入与压缩等大量零散算子吸收进单个 kernel，消除 kernel 调度与中间结果的显存往返开销，并通过 tile 级流水编排让各阶段的计算与访存相互掩盖，进一步提升 GPU 算力利用率。
+- **DSA Indexer 准备**：[`indexer_prepare`](docs/indexer_prepare.md) 将 Q/K 投影、归一化、RoPE、Hadamard、FP8 量化、分页 K cache 写入与权重缩放融合为单个 kernel，支持固定的 64 头、128 维 indexer 配置。
 - **端到端低精度**：量化、SwiGLU 融合量化与 expert 重排等算子直接输出 GEMM 所需的 scale 布局，低精度数据在算子之间流转无需额外的布局转换。
 
 ## 性能

@@ -15,6 +15,27 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
+#include <optional>
+#include <string>
+
+namespace halops::indexer {
+
+void IndexerPrepare(torch::Tensor x, torch::Tensor q_lora, torch::Tensor wk_w,
+                    torch::Tensor wq_b, torch::Tensor wq_b_sf,
+                    torch::Tensor k_norm_weight, torch::Tensor k_norm_bias,
+                    double k_norm_eps, torch::Tensor rope_cos_sin_cache,
+                    torch::Tensor positions, torch::Tensor paged_k_cache,
+                    torch::Tensor out_cache_loc, torch::Tensor q,
+                    std::optional<torch::Tensor> sf_q, torch::Tensor weights,
+                    torch::Tensor workspace, double weight_scale,
+                    int64_t head_dim, int64_t n_heads, bool apply_hadamard,
+                    bool skip_q, const std::string& output_dtype_str,
+                    bool is_neox_style, bool use_pdl);
+
+std::vector<int64_t> IndexerPrepareWorkspaceBytes(int64_t num_tokens);
+
+}  // namespace halops::indexer
+
 namespace halops {
 
 void WriteCacheKVEncoder(
@@ -192,4 +213,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mla_attention", &halops::MlaAttention);
     m.def("combine_with_rope_quant", &halops::CombineWithRopeQuant);
     m.def("mla_output_proj", &halops::MlaOutputProj);
+    m.def("indexer_prepare_workspace_bytes",
+          &halops::indexer::IndexerPrepareWorkspaceBytes);
+    m.def(
+        "indexer_prepare", &halops::indexer::IndexerPrepare, pybind11::arg("x"),
+        pybind11::arg("q_lora"), pybind11::arg("wk_w"), pybind11::arg("wq_b"),
+        pybind11::arg("wq_b_sf"), pybind11::arg("k_norm_weight"),
+        pybind11::arg("k_norm_bias"), pybind11::arg("k_norm_eps"),
+        pybind11::arg("rope_cos_sin_cache"), pybind11::arg("positions"),
+        pybind11::arg("paged_k_cache"), pybind11::arg("out_cache_loc"),
+        pybind11::arg("q"), pybind11::arg("sf_q"), pybind11::arg("weights"),
+        pybind11::arg("workspace"), pybind11::arg("weight_scale"),
+        pybind11::arg("head_dim"), pybind11::arg("n_heads"),
+        pybind11::arg("apply_hadamard"), pybind11::arg("skip_q"),
+        pybind11::arg("output_dtype_str") = "fp8",
+        pybind11::arg("is_neox_style") = true, pybind11::arg("use_pdl") = true);
 }
