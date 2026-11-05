@@ -96,6 +96,9 @@ __global__ void __launch_bounds__(KernelTraits::NumThreads, 1, 1)
         }
         plan.acquire_tmem();
     }
+    // Keep static weights and non-dependent metadata outside the PDL wait.
+    if (params.use_pdl && warp == KernelTraits::Roles::PrefetchWarp)
+        params.prefetch_pdl_inputs();
     if (params.use_pdl) cudaGridDependencySynchronize();
     __syncthreads();
     if (params.use_pdl && threadIdx.x == 0)

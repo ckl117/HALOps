@@ -627,6 +627,8 @@ struct IndexerDeviceParams {
     const __nv_bfloat16* __restrict__ x;
     const __nv_bfloat16* __restrict__ key_weight_projection;
     const __nv_bfloat16* __restrict__ q_lora;
+    const char* __restrict__ query_weight;
+    const char* __restrict__ query_weight_scales;
     const float* __restrict__ k_norm_weight;
     const float* __restrict__ k_norm_bias;
     const float* __restrict__ rope;
@@ -673,6 +675,187 @@ struct IndexerDeviceParams {
             cute::prefetch_tma_descriptor(
                 query_lora_descriptors.tma_sfa.get_tma_descriptor());
         }
+    }
+
+    CUTE_DEVICE void prefetch_l2_bytes(const char* base, int64_t bytes) const {
+        constexpr int kCacheLineBytes = 128;
+        const int lane = threadIdx.x & (KernelTraits::WarpSize - 1);
+        const int64_t line_count =
+            (bytes + kCacheLineBytes - 1) / kCacheLineBytes;
+        for (int64_t line = lane; line < line_count;
+             line += KernelTraits::WarpSize)
+            intrinsics::prefetch_global_l2(base + line * kCacheLineBytes);
+    }
+
+    CUTE_DEVICE void prefetch_l2_span_single_lane(const char* base,
+                                                  int64_t bytes) const {
+        constexpr int kCacheLineBytes = 128;
+        const int64_t line_count =
+            (bytes + kCacheLineBytes - 1) / kCacheLineBytes;
+        for (int64_t line = 0; line < line_count; ++line)
+            intrinsics::prefetch_global_l2(base + line * kCacheLineBytes);
+    }
+
+    CUTE_DEVICE void prefetch_l2_matrix_tile(const char* base, int row_start,
+                                             int row_count,
+                                             int row_stride_bytes,
+                                             int column_offset_bytes,
+                                             int row_bytes) const {
+        constexpr int kCacheLineBytes = 128;
+        const int lines_per_row =
+            (row_bytes + kCacheLineBytes - 1) / kCacheLineBytes;
+        const int line_count = row_count * lines_per_row;
+        const int lane = threadIdx.x & (KernelTraits::WarpSize - 1);
+        for (int line = lane; line < line_count;
+             line += KernelTraits::WarpSize) {
+            const int row = line / lines_per_row;
+            const int column = line % lines_per_row;
+            intrinsics::prefetch_global_l2(
+                base + (int64_t)(row_start + row) * row_stride_bytes +
+                column_offset_bytes + column * kCacheLineBytes);
+        }
+    }
+
+    CUTE_DEVICE GemmWorkItem query_work_item_for_prefetch(int item) const {
+        using QueryConfig = typename KernelTraits::Query;
+        if (num_tokens > TokenTile && num_tokens % TokenTile != 0)
+            item = (item % Dimensions::NUM_HEADS) * token_groups +
+                   item / Dimensions::NUM_HEADS;
+        const int token_group = item % token_groups;
+        const int rest = item / token_groups;
+        const int split_index = rest % QueryConfig::KSplit;
+        const int weight_tile = rest / QueryConfig::KSplit;
+        const int n_base = token_group * TokenTile;
+        return GemmWorkItem{
+            .n_row = n_base,
+            .weight_tile = weight_tile,
+            .m_total = query_rows,
+            .k_tile_begin = split_index * query_tiles_per_split,
+            .a_k_tile_begin = split_index * query_tiles_per_split,
+            .out_row_stride = QueryConfig::KSplit * query_rows,
+            .valid_tokens = min(TokenTile, num_tokens - n_base)};
+    }
+
+    CUTE_DEVICE void prefetch_pdl_weights() const {
+        using KeyWeightConfig = typename KernelTraits::KeyWeight;
+        using QueryConfig = typename KernelTraits::Query;
+
+        // These inputs are independent of the predecessor's activation writes.
+        prefetch_l2_bytes(reinterpret_cast<const char*>(k_norm_weight),
+                          Dimensions::HEAD_DIM * sizeof(float));
+        prefetch_l2_bytes(reinterpret_cast<const char*>(k_norm_bias),
+                          Dimensions::HEAD_DIM * sizeof(float));
+
+        constexpr int key_row_stride =
+            Dimensions::HIDDEN * sizeof(__nv_bfloat16);
+        constexpr int key_tile_bytes =
+            KeyWeightConfig::BK * sizeof(__nv_bfloat16);
+        if (uses_simt_projection()) {
+            const int head = (int)blockIdx.x;
+            if (head < Dimensions::NUM_HEADS) {
+                prefetch_l2_matrix_tile(
+                    reinterpret_cast<const char*>(key_weight_projection),
+                    2 * head, 1, key_row_stride, 0,
+                    Dimensions::HIDDEN * sizeof(__nv_bfloat16));
+                prefetch_l2_matrix_tile(
+                    reinterpret_cast<const char*>(key_weight_projection),
+                    Dimensions::HEAD_DIM + head, 1, key_row_stride, 0,
+                    Dimensions::HIDDEN * sizeof(__nv_bfloat16));
+            }
+            return;
+        }
+
+        for (int item = key_weight_work_start(); item < key_weight_work_items;
+             item += key_weight_work_stride()) {
+            const auto work = key_weight_work_item_at<KeyWeightConfig>(
+                item, token_groups, key_weight_splits,
+                key_weight_tiles_per_split, num_tokens);
+            const int row_start = work.weight_tile * KeyWeightConfig::BM;
+            const int row_count = min(KeyWeightConfig::BM,
+                                      Dimensions::KEY_WEIGHT_ROWS - row_start);
+            for (int k = 0; k < key_weight_tiles_per_split; ++k) {
+                const int k_tile = work.first_k_tile + k;
+                prefetch_l2_matrix_tile(
+                    reinterpret_cast<const char*>(key_weight_projection),
+                    row_start, row_count, key_row_stride,
+                    k_tile * key_tile_bytes, key_tile_bytes);
+            }
+        }
+
+        if (skip_q) return;
+
+        constexpr int query_row_stride = Dimensions::QUERY_LORA_RANK;
+        constexpr int query_tile_bytes = QueryConfig::BK;
+        constexpr int query_scale_row_bytes =
+            Dimensions::QUERY_LORA_RANK / Dimensions::MX_GROUP_SIZE;
+        int previous_weight_tile = -1;
+        for (int item = query_work_start(); item < query_work_items;
+             item += query_work_stride()) {
+            const auto work = query_work_item_for_prefetch(item);
+            const int row_start = work.weight_tile * QueryConfig::BM;
+            const int row_count =
+                min(QueryConfig::BM, Dimensions::QUERY_ROWS - row_start);
+            for (int k = 0; k < query_tiles_per_split; ++k) {
+                const int k_tile = work.k_tile_begin + k;
+                prefetch_l2_matrix_tile(
+                    query_weight, row_start, row_count, query_row_stride,
+                    k_tile * query_tile_bytes, query_tile_bytes);
+            }
+            if (work.weight_tile != previous_weight_tile) {
+                prefetch_l2_bytes(
+                    query_weight_scales +
+                        (int64_t)row_start * query_scale_row_bytes,
+                    (int64_t)row_count * query_scale_row_bytes);
+                previous_weight_tile = work.weight_tile;
+            }
+        }
+    }
+
+    CUTE_DEVICE void prefetch_pdl_token_inputs() const {
+        const int lane = threadIdx.x & (KernelTraits::WarpSize - 1);
+        const int block_stride = gridDim.x * KernelTraits::WarpSize;
+        const int data_bytes =
+            is_fp4 ? Dimensions::HEAD_DIM / 2 : Dimensions::HEAD_DIM;
+
+        for (int token = (int)blockIdx.x * KernelTraits::WarpSize + lane;
+             token < num_tokens; token += block_stride) {
+            const char* positions_base =
+                reinterpret_cast<const char*>(positions);
+            const char* cache_locs_base =
+                reinterpret_cast<const char*>(out_cache_loc);
+            const int index_bytes =
+                positions_are_int64 ? sizeof(int64_t) : sizeof(int);
+            const int cache_index_bytes =
+                cache_slots_are_int64 ? sizeof(int64_t) : sizeof(int);
+            intrinsics::prefetch_global_l2(positions_base +
+                                           (int64_t)token * index_bytes);
+            intrinsics::prefetch_global_l2(cache_locs_base +
+                                           (int64_t)token * cache_index_bytes);
+
+            const int position = position_of(token);
+            prefetch_l2_span_single_lane(
+                reinterpret_cast<const char*>(rope) +
+                    (int64_t)position * Dimensions::ROPE_DIM * sizeof(float),
+                Dimensions::ROPE_DIM * sizeof(float));
+
+            const int cache_slot = cache_loc_of(token);
+            if (cache_slot < 0) continue;
+            const int page = cache_slot >> page_shift;
+            const int slot = cache_slot & (page_size - 1);
+            const char* page_start = reinterpret_cast<const char*>(key_cache) +
+                                     (int64_t)page * cache_row_bytes;
+            prefetch_l2_span_single_lane(
+                page_start + (int64_t)slot * data_bytes, data_bytes);
+            prefetch_l2_span_single_lane(
+                page_start + (int64_t)page_size * data_bytes +
+                    (int64_t)slot * Dimensions::CACHE_SCALE_BYTES,
+                Dimensions::CACHE_SCALE_BYTES);
+        }
+    }
+
+    CUTE_DEVICE void prefetch_pdl_inputs() const {
+        prefetch_pdl_weights();
+        prefetch_pdl_token_inputs();
     }
 
     CUTE_DEVICE int position_of(int token) const {
@@ -880,6 +1063,9 @@ auto make_indexer_device_params(const IndexerHostParams& host, int sm_count,
     params.key_weight_projection =
         static_cast<const __nv_bfloat16*>(host.wk_w.data_ptr());
     params.q_lora = static_cast<const __nv_bfloat16*>(host.q_lora.data_ptr());
+    params.query_weight = static_cast<const char*>(host.wq_b.data_ptr());
+    params.query_weight_scales =
+        static_cast<const char*>(host.wq_b_sf.data_ptr());
     params.k_norm_weight = host.k_norm_weight.data_ptr<float>();
     params.k_norm_bias = params.use_layernorm
                              ? host.k_norm_bias.data_ptr<float>()

@@ -42,6 +42,11 @@ using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
 namespace halops::indexer::intrinsics {
 
 CUTE_DEVICE
+void prefetch_global_l2(const void* address) {
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(address));
+}
+
+CUTE_DEVICE
 void gmem_red_add1_release(int* p) {
     asm volatile("red.release.gpu.global.add.s32 [%0], 1;" ::"l"(p) : "memory");
 }

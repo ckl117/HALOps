@@ -47,6 +47,11 @@ __global__ void __launch_bounds__(SINGLE_TOKEN
         }
         plan.acquire_tmem();
     }
+    // Only x, q_lora, and the private workspace depend on the predecessor.
+    // Warm independent weights and metadata before waiting on its global
+    // stores.
+    if (params.use_pdl && warp_idx == Roles::PrefetchWarp)
+        params.prefetch_pdl_inputs();
     if (params.use_pdl) cudaGridDependencySynchronize();
     __syncthreads();
     // Successors may initialize early but must wait for this grid's outputs.

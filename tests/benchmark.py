@@ -1,7 +1,10 @@
 """Compare SGLang dual stream, HALOps dual stream and fused indexer_prepare.
 
-Default: every batch size in range(1, 513), FP8 and MXFP4, cold L2, CUPTI off,
---timing timed_graph. Pass --output-dtype mxfp8 to validate and measure only the
+Default: every batch size in range(1, 513), MXFP4, Score FP32, cold L2, CUPTI off,
+--backends sglang indexer_prepare, --timing timed_graph. --score-dtype bf16
+selects native BF16 head-gate weights; this preparation benchmark does not time
+the downstream score GEMM. Add halops_dense to --backends for HALOps dual stream.
+Pass --output-dtype mxfp8 to validate and measure only the
 fused indexer_prepare path; the dual-stream paths do not support MXFP8 output.
 Pass --output-dtype mxfp4_mxfp8 to compare the fused operator's MXFP4 and MXFP8
 latency. TimedGraph captures --graph-iters calls (default 16) in
@@ -65,6 +68,12 @@ DUAL_STREAM_IMPLEMENTATIONS = (
 )
 FUSED_IMPLEMENTATION = "halops_indexer_prepare"
 IMPLEMENTATIONS = (*DUAL_STREAM_IMPLEMENTATIONS, FUSED_IMPLEMENTATION)
+BACKENDS = {
+    "sglang": DUAL_STREAM_IMPLEMENTATIONS[0],
+    "halops_dense": DUAL_STREAM_IMPLEMENTATIONS[1],
+    "indexer_prepare": FUSED_IMPLEMENTATION,
+}
+SCORE_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 OUTPUT_DTYPE_CHOICES = ("fp8", "mxfp4", "mxfp8", "both", "mxfp4_mxfp8")
 
 
@@ -119,7 +128,7 @@ def make_weights(max_tokens, seed):
     )
 
 
-def make_case(tokens, output_dtype, weights):
+def make_case(tokens, output_dtype, weights, score_dtype="fp32"):
     torch.manual_seed(1000 + tokens)
     data_bytes = HEAD_DIM // 2 if output_dtype == "mxfp4" else HEAD_DIM
     cache_shape = (
@@ -129,6 +138,7 @@ def make_case(tokens, output_dtype, weights):
     return SimpleNamespace(
         tokens=tokens,
         output_dtype=output_dtype,
+        score_dtype=score_dtype,
         static=weights,
         x=torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda"),
         q_lora=torch.randn(tokens, RANK, dtype=torch.bfloat16, device="cuda"),
@@ -163,6 +173,7 @@ def call_halops(case, **options):
         is_neox_style=case.neox,
         apply_hadamard=case.hadamard,
         out_qk_dtype_str=case.output_dtype,
+        out_weights_dtype=SCORE_DTYPES[case.score_dtype],
         **options,
     )
 
@@ -212,7 +223,8 @@ class DualStream:
         indexer = object.__new__(self.indexer_type)
         indexer.n_heads, indexer.head_dim, indexer.q_lora_rank = HEADS, HEAD_DIM, RANK
         indexer.softmax_scale = HEAD_DIM**-0.5
-        indexer.use_bf16_indexer = indexer.logits_weights_bf16 = False
+        indexer.use_bf16_indexer = False
+        indexer.logits_weights_bf16 = case.score_dtype == "bf16"
         indexer.use_fp4_indexer = case.output_dtype == "mxfp4"
         indexer.use_dsa_indexer_fusion = indexer.eb5_dsa_indexer_fusion = True
         indexer.eb5_indexer_hadamard = True
@@ -389,6 +401,7 @@ def reference(case, source=None):
     output_weights = raw_weights * WEIGHT_SCALE
     if not fp4 and not mxfp8:
         output_weights = output_weights * query_scales
+    output_weights = output_weights.to(SCORE_DTYPES[case.score_dtype])
     return (
         (query_codes, query_scales),
         output_weights,
@@ -468,7 +481,7 @@ def validate_result(case, result, cache, expected, source=False):
     assert output_weights.shape == (
         (case.tokens, HEADS, 1) if source else (case.tokens, HEADS)
     )
-    assert output_weights.dtype == torch.float32
+    assert output_weights.dtype == SCORE_DTYPES[case.score_dtype]
     key, key_scales, valid = read_cache(case, cache)
     key_ref, key_scales_ref = key_ref[valid], key_scales_ref[valid]
     if fp4:
@@ -579,7 +592,8 @@ def validate(case, name, call, adapter):
         )
     except AssertionError as error:
         raise AssertionError(
-            f"{name} {case.output_dtype} bsz={case.tokens}: {error}"
+            f"{name} {case.output_dtype} score={case.score_dtype} "
+            f"bsz={case.tokens}: {error}"
         ) from error
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -745,10 +759,25 @@ def parse_args():
     parser.add_argument(
         "--output-dtype",
         choices=OUTPUT_DTYPE_CHOICES,
-        default="both",
-        help="both runs the legacy FP8/MXFP4 comparison; mxfp8 runs only the "
+        default="mxfp4",
+        help="Q/K precision (default: mxfp4); both runs FP8 and MXFP4; "
+        "mxfp8 runs only the "
         "fused indexer_prepare path because the dual-stream paths do not support it; "
         "mxfp4_mxfp8 compares the fused operator's two formats",
+    )
+    parser.add_argument(
+        "--score-dtype",
+        type=str.lower,
+        choices=tuple(SCORE_DTYPES),
+        default="bf16",
+        help="native head-gate weights dtype for Score FP32/BF16 (default: fp32)",
+    )
+    parser.add_argument(
+        "--backends",
+        nargs="+",
+        choices=tuple(BACKENDS),
+        help="backends to compare (default: sglang indexer_prepare; "
+        "mxfp8 and mxfp4_mxfp8 default to indexer_prepare only)",
     )
     parser.add_argument(
         "--timing",
@@ -792,6 +821,18 @@ def parse_args():
         parser.error("batch sizes must be positive")
     if args.graph_iters is None:
         args.graph_iters = 16 if args.timing == "timed_graph" else 1
+    fused_formats_only = args.output_dtype in ("mxfp8", "mxfp4_mxfp8")
+    if args.backends is None:
+        args.backends = (
+            ["indexer_prepare"] if fused_formats_only else ["sglang", "indexer_prepare"]
+        )
+    else:
+        args.backends = list(dict.fromkeys(args.backends))
+        if fused_formats_only and args.backends != ["indexer_prepare"]:
+            parser.error(
+                f"--output-dtype {args.output_dtype} requires "
+                "--backends indexer_prepare"
+            )
     return args
 
 
@@ -805,18 +846,19 @@ def main():
         formats = ("mxfp4", "mxfp8")
     else:
         formats = (args.output_dtype,)
-    fused_only = args.output_dtype in ("mxfp8", "mxfp4_mxfp8")
+    active_implementations = tuple(BACKENDS[name] for name in args.backends)
+    fused_only = active_implementations == (FUSED_IMPLEMENTATION,)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     result_files = ("latency.csv", "samples.jsonl", "validation.jsonl", "metadata.json")
     if any((args.output_dir / filename).exists() for filename in result_files):
         raise FileExistsError(f"Choose a fresh --output-dir: {args.output_dir}")
 
     weights = make_weights(max(args.batch_sizes), args.seed)
-    adapters = (
-        {name: DualStream(weights, name) for name in DUAL_STREAM_IMPLEMENTATIONS}
-        if not fused_only
-        else {}
-    )
+    adapters = {
+        name: DualStream(weights, name)
+        for name in active_implementations
+        if name in DUAL_STREAM_IMPLEMENTATIONS
+    }
     timed_graph = args.timing == "timed_graph"
     if args.l2_cache == "hot":
         l2 = "no explicit flush; warmup and replay reuse the same inputs/weights"
@@ -831,6 +873,8 @@ def main():
         )
     metadata = {
         "arguments": {**vars(args), "output_dir": str(args.output_dir)},
+        "implementations": active_implementations,
+        "score_dtype": args.score_dtype,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "completed": False,
         "versions": {
@@ -892,6 +936,7 @@ def main():
     metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     fields = [
         "output_dtype",
+        "score_dtype",
         "bsz",
         "timing",
         "l2_cache",
@@ -913,10 +958,10 @@ def main():
         writer = csv.DictWriter(csv_file, fieldnames=fields)
         writer.writeheader()
         if not args.validate_only:
-            control = make_case(min(128, max(args.batch_sizes)), formats[0], weights)
-            control_implementation = (
-                FUSED_IMPLEMENTATION if fused_only else "sglang_dual_stream"
+            control = make_case(
+                min(128, max(args.batch_sizes)), formats[0], weights, args.score_dtype
             )
+            control_implementation = active_implementations[0]
             control_call = (
                 adapters[control_implementation].bind(control)
                 if control_implementation in adapters
@@ -926,6 +971,7 @@ def main():
                 "implementation": control_implementation,
                 "bsz": control.tokens,
                 "output_dtype": formats[0],
+                "score_dtype": args.score_dtype,
                 "before_samples_us": measure(control_call, control, args),
             }
         if args.output_dtype == "mxfp4_mxfp8":
@@ -944,10 +990,7 @@ def main():
                 for batch_index, tokens in enumerate(args.batch_sizes)
             ]
         for output_dtype, batch_index, tokens in cases:
-            active_implementations = (
-                (FUSED_IMPLEMENTATION,) if fused_only else IMPLEMENTATIONS
-            )
-            inputs = make_case(tokens, output_dtype, weights)
+            inputs = make_case(tokens, output_dtype, weights, args.score_dtype)
             calls = {name: adapter.bind(inputs) for name, adapter in adapters.items()}
             calls[FUSED_IMPLEMENTATION] = call_halops
             medians = {}
@@ -960,6 +1003,7 @@ def main():
                     json.dumps(
                         {
                             "output_dtype": output_dtype,
+                            "score_dtype": args.score_dtype,
                             "bsz": tokens,
                             "implementation": name,
                             "relative_rms": errors,
@@ -970,13 +1014,16 @@ def main():
                 )
                 validation_file.flush()
                 if not args.validate_only:
-                    torch.cuda.nvtx.range_push(f"{name},bsz={tokens}")
+                    torch.cuda.nvtx.range_push(
+                        f"{name},{output_dtype},score={args.score_dtype},bsz={tokens}"
+                    )
                     samples = measure(calls[name], inputs, args)
                     medians[name] = statistics.median(samples)
                     sample_file.write(
                         json.dumps(
                             {
                                 "output_dtype": output_dtype,
+                                "score_dtype": args.score_dtype,
                                 "bsz": tokens,
                                 "implementation": name,
                                 "timing": args.timing,
@@ -990,9 +1037,10 @@ def main():
                     sample_file.flush()
                     torch.cuda.nvtx.range_pop()
             if not args.validate_only:
-                timing_by_format.setdefault(output_dtype, {})[tokens] = medians[
-                    FUSED_IMPLEMENTATION
-                ]
+                if FUSED_IMPLEMENTATION in medians:
+                    timing_by_format.setdefault(output_dtype, {})[tokens] = medians[
+                        FUSED_IMPLEMENTATION
+                    ]
                 mxfp8_over_mxfp4 = (
                     timing_by_format["mxfp8"][tokens]
                     / timing_by_format["mxfp4"][tokens]
@@ -1003,6 +1051,7 @@ def main():
                 writer.writerow(
                     {
                         "output_dtype": output_dtype,
+                        "score_dtype": args.score_dtype,
                         "bsz": tokens,
                         "timing": args.timing,
                         "l2_cache": args.l2_cache,
@@ -1014,13 +1063,15 @@ def main():
                         "sglang_over_indexer": (
                             medians[DUAL_STREAM_IMPLEMENTATIONS[0]]
                             / medians[FUSED_IMPLEMENTATION]
-                            if not fused_only
+                            if DUAL_STREAM_IMPLEMENTATIONS[0] in medians
+                            and FUSED_IMPLEMENTATION in medians
                             else ""
                         ),
                         "halops_dual_over_indexer": (
                             medians[DUAL_STREAM_IMPLEMENTATIONS[1]]
                             / medians[FUSED_IMPLEMENTATION]
-                            if not fused_only
+                            if DUAL_STREAM_IMPLEMENTATIONS[1] in medians
+                            and FUSED_IMPLEMENTATION in medians
                             else ""
                         ),
                         "fused_mxfp8_over_mxfp4": mxfp8_over_mxfp4,
@@ -1033,6 +1084,7 @@ def main():
                     json.dumps(
                         {
                             "output_dtype": output_dtype,
+                            "score_dtype": args.score_dtype,
                             "bsz": tokens,
                             "elapsed_seconds": time.monotonic() - start,
                             **gpu_state(),
@@ -1042,7 +1094,8 @@ def main():
                 )
                 gpu_file.flush()
                 print(
-                    f"{output_dtype} bsz={tokens}: {medians or 'validated'} "
+                    f"{output_dtype} score={args.score_dtype} bsz={tokens}: "
+                    f"{medians or 'validated'} "
                     f"elapsed={time.monotonic() - start:.1f}s",
                     flush=True,
                 )
@@ -1075,11 +1128,7 @@ def main():
             }
     metadata.update(
         completed=True,
-        cases=sum(
-            len(args.batch_sizes)
-            * (1 if fused_only or output_dtype == "mxfp8" else len(IMPLEMENTATIONS))
-            for output_dtype in formats
-        ),
+        cases=rows * len(active_implementations),
         elapsed_seconds=time.monotonic() - start,
         gpu_after=gpu_state(),
     )
